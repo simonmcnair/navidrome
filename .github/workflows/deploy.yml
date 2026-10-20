@@ -1,0 +1,88 @@
+name: Deploy
+
+# Pull requests: check the stack is valid (CI).
+# Merges to main: check again, cut a release, deploy it to the host, and roll
+# back to the last good release if it is unhealthy (CD).
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate docker-compose.yml
+        run: |
+          cp .env.example .env
+          docker compose config -q
+      - name: Lint deploy script
+        run: shellcheck scripts/*.sh
+
+  release:
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Pick the release tag
+        id: tag
+        run: |
+          existing=$(git tag --points-at HEAD --list 'v*' | sort -V | tail -n1)
+          if [[ -n "$existing" ]]; then
+            echo "tag=$existing" >> "$GITHUB_OUTPUT"
+            echo "reuse=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          latest=$(git tag --list 'v*' --sort=-v:refname | head -n1)
+          if [[ -z "$latest" ]]; then
+            next=v1.0.0
+          else
+            IFS=. read -r major minor patch <<< "${latest#v}"
+            next="v$major.$minor.$((patch + 1))"
+          fi
+          echo "tag=$next" >> "$GITHUB_OUTPUT"
+      - name: Create the release
+        if: steps.tag.outputs.reuse != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ steps.tag.outputs.tag }}" --target "$GITHUB_SHA" --generate-notes
+
+  deploy:
+    needs: release
+    # The runner installed on the host (see docs/DEPLOYMENT.md).
+    runs-on: [self-hosted, navidrome]
+    concurrency:
+      group: deploy-host
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.release.outputs.tag }}
+      - name: Deploy, health-check, roll back on failure
+        env:
+          DEPLOY_DIR: ${{ vars.DEPLOY_DIR || '/opt/navidrome' }}
+        run: scripts/deploy.sh "$GITHUB_WORKSPACE" "${{ needs.release.outputs.tag }}" "$DEPLOY_DIR"
+
+  mark-rolled-back:
+    needs: [release, deploy]
+    if: failure() && needs.release.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark the release as rolled back
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG (failed, rolled back)" --prerelease --latest=false

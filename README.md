@@ -87,6 +87,11 @@ Check:
     docker compose logs -f authentik-server
     docker compose logs -f traefik
 
+To have changes to this repo deployed to the host automatically, with a
+release per change and rollback if a deploy fails, see
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md). That replaces the manual start
+above.
+
 ## 5. Initial Authentik setup
 
 The admin account is created automatically on first start from
