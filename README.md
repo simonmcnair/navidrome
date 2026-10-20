@@ -138,7 +138,7 @@ container is required.
 
 Create a group/user binding so only the users you want can access Navidrome.
 
-## 7. Navidrome/Symfonium detail
+## 7. Navidrome web UI and Subsonic API
 
 The Navidrome web UI is protected by Authentik ForwardAuth, and you are logged
 in to Navidrome automatically as the user Authentik reports
@@ -156,12 +156,12 @@ only gate there. Two things protect it:
   username. Never remove it from the `navidrome-api` router while SSO is on.
 - A Traefik rate limit (50 req/s, burst 100). This is too generous to stop
   password guessing on its own, so use a long random Navidrome password
-  (Symfonium stores it; you never type it). For active blocking, point
+  (your player app stores it; you never type it). For active blocking, point
   CrowdSec or fail2ban at `logs/access.log` and ban IPs with repeated
   Subsonic auth failures.
 
 To put `/rest/` behind Authentik anyway, change the
-`navidrome-api.middlewares` label to `authentik@docker` (Symfonium will then
+`navidrome-api.middlewares` label to `authentik@docker` (mobile players will then
 most likely fail to connect).
 
 Navidrome public share links (`/share/`, off by default) will hit the
@@ -171,13 +171,39 @@ the `authentik@docker` middleware.
 Other containers on the `proxy` network can reach Navidrome directly, but
 only Traefik's address is trusted for the SSO header.
 
-## 8. Symfonium
+## 8. Mobile clients (Android)
 
-Server:
+Any Subsonic-compatible app works, because they all use the `/rest/` API,
+which is not behind Authentik (see section 7). These are free:
 
-    https://35.example.com
+| App | Open source | Offline | Notes |
+|---|---|---|---|
+| **Tempus** (recommended) | Yes | Yes | Actively maintained fork of Tempo. Material You design, Android Auto, Chromecast. |
+| Ultrasonic | Yes | Yes | Mature and very stable, plainer UI. Best fallback. |
+| Substreamer | No | Yes | Polished, also on iOS. Not on F-Droid. |
+| DSub | Yes | Yes | Old but works; little active development. |
 
-Then use your normal Navidrome username/password.
+Symfonium also works but is paid.
+
+### Install Tempus
+
+- From [F-Droid](https://f-droid.org/) or [IzzyOnDroid](https://apt.izzysoft.de/fdroid/), or
+- From the [GitHub releases](https://github.com/eddyizm/tempus/releases)
+  APK if you want Android Auto and Chromecast (the F-Droid build leaves
+  them out).
+
+### Configure any of these apps
+
+1. Add a server.
+2. Server URL: `https://35.example.com` (your `DOMAIN`), with `https://` and
+   with no `/rest` on the end; the app adds that itself.
+3. Username and password: your **Navidrome** login, not your Authentik one.
+4. Save, then test the connection. If it fails, check you can open
+   `https://35.example.com/rest/ping.view` in a browser (it should answer
+   with an error about missing parameters, not an Authentik login page).
+
+Avoid web-based or PWA players (such as Castafiore) and Navidrome share
+links: they go through the web UI, so Authentik will redirect or block them.
 
 ## 9. Adding other applications
 
