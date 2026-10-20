@@ -1,0 +1,242 @@
+services:
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: traefik-socket-proxy
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      NETWORKS: 1
+      SERVICES: 1
+      EVENTS: 1
+      PING: 1
+      VERSION: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - socket-proxy
+
+  traefik:
+    image: traefik:v3.5
+    container_name: traefik
+    restart: unless-stopped
+    depends_on:
+      - socket-proxy
+    command:
+      - --api.dashboard=false
+      - --providers.docker=true
+      - --providers.docker.endpoint=tcp://socket-proxy:2375
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=proxy
+
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+
+      - --certificatesresolvers.cloudflare.acme.email=${ACME_EMAIL}
+      - --certificatesresolvers.cloudflare.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.cloudflare.acme.dnschallenge=true
+      - --certificatesresolvers.cloudflare.acme.dnschallenge.provider=cloudflare
+      - --certificatesresolvers.cloudflare.acme.dnschallenge.resolvers=1.1.1.1:53,1.0.0.1:53
+
+      - --log.level=INFO
+      - --accesslog=true
+      # Written to ./logs so fail2ban/CrowdSec can watch for /rest/ login failures.
+      - --accesslog.filepath=/logs/access.log
+    environment:
+      CF_DNS_API_TOKEN: ${CF_DNS_API_TOKEN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./letsencrypt:/letsencrypt
+      - ./logs:/logs
+    networks:
+      socket-proxy:
+      proxy:
+        # Fixed address so Navidrome trusts the SSO header from Traefik only.
+        ipv4_address: ${TRAEFIK_PROXY_IP}
+
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    restart: unless-stopped
+    user: "${PUID}:${PGID}"
+    environment:
+      ND_LOGLEVEL: info
+      ND_BASEURL: https://${DOMAIN}
+      # Single sign-on: trust the username Authentik passes through Traefik,
+      # so the web UI doesn't ask for a second login. Only Traefik's address
+      # is trusted. The /rest/ router strips this header (see below).
+      ND_REVERSEPROXYUSERHEADER: X-authentik-username
+      ND_REVERSEPROXYWHITELIST: ${TRAEFIK_PROXY_IP}/32
+    volumes:
+      - ${NAVIDROME_DATA}:/data
+      - ${MUSIC_PATH}:/music:ro
+    networks:
+      - proxy
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.services.navidrome.loadbalancer.server.port=4533
+
+      # Web UI: protected by Authentik forward-auth.
+      # Explicit low priority so the more specific routers below always win.
+      - traefik.http.routers.navidrome.rule=Host(`${DOMAIN}`)
+      - traefik.http.routers.navidrome.priority=1
+      - traefik.http.routers.navidrome.entrypoints=websecure
+      - traefik.http.routers.navidrome.tls=true
+      - traefik.http.routers.navidrome.tls.certresolver=cloudflare
+      - traefik.http.routers.navidrome.middlewares=authentik@docker
+      - traefik.http.routers.navidrome.service=navidrome
+
+      # Subsonic API (/rest/): NOT behind Authentik. Symfonium and other
+      # Subsonic clients cannot follow Authentik's browser redirect flow, so
+      # Navidrome's own authentication is the gate here. Rate-limited instead.
+      - traefik.http.routers.navidrome-api.rule=Host(`${DOMAIN}`) && PathPrefix(`/rest/`)
+      - traefik.http.routers.navidrome-api.priority=90
+      - traefik.http.routers.navidrome-api.entrypoints=websecure
+      - traefik.http.routers.navidrome-api.tls=true
+      - traefik.http.routers.navidrome-api.tls.certresolver=cloudflare
+      # strip-sso-header MUST stay first: /rest/ bypasses Authentik, so a client
+      # could otherwise send its own X-authentik-username and log in as anyone.
+      - traefik.http.routers.navidrome-api.middlewares=strip-sso-header,navidrome-ratelimit
+      - traefik.http.routers.navidrome-api.service=navidrome
+      - traefik.http.middlewares.navidrome-ratelimit.ratelimit.average=50
+      - traefik.http.middlewares.navidrome-ratelimit.ratelimit.period=1s
+      - traefik.http.middlewares.navidrome-ratelimit.ratelimit.burst=100
+      # An empty value makes Traefik remove the header from the request.
+      - traefik.http.middlewares.strip-sso-header.headers.customrequestheaders.X-authentik-username=
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: authentik-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: authentik
+      POSTGRES_USER: authentik
+      POSTGRES_PASSWORD: ${PG_PASS}
+    volumes:
+      - authentik_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U authentik -d authentik"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      - authentik-internal
+
+  authentik-server:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_TAG}
+    container_name: authentik-server
+    restart: unless-stopped
+    command: server
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__PORT: 5432
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+      AUTHENTIK_DISABLE_UPDATE_CHECK: "false"
+      # Creates the akadmin account on first start, so nobody on the Internet
+      # can claim it through the public initial-setup page.
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL}
+    volumes:
+      - authentik_media:/media
+      - authentik_templates:/templates
+    ports:
+      # LAN admin access. Never forward TCP 9000 from the Internet. Docker
+      # published ports bypass the NAS firewall, so bind to the LAN IP only
+      # (AUTHENTIK_ADMIN_BIND in .env; defaults to localhost if unset).
+      - "${AUTHENTIK_ADMIN_BIND:-127.0.0.1}:9000:9000"
+    healthcheck:
+      test: ["CMD-SHELL", "ak healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - authentik-internal
+      - proxy
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=proxy
+      - traefik.http.services.authentik.loadbalancer.server.port=9000
+
+      # Authentik UI/flows on its own hostname. The browser is redirected here
+      # to log in, so it must be reachable from the Internet and must NOT use
+      # the forward-auth middleware. Set the embedded outpost's authentik_host
+      # to https://${AUTHENTIK_DOMAIN} (see README).
+      - traefik.http.routers.authentik.rule=Host(`${AUTHENTIK_DOMAIN}`)
+      - traefik.http.routers.authentik.entrypoints=websecure
+      - traefik.http.routers.authentik.tls=true
+      - traefik.http.routers.authentik.tls.certresolver=cloudflare
+      - traefik.http.routers.authentik.service=authentik
+
+      # Embedded outpost endpoint on the protected application's hostname.
+      # Must stay reachable without the forward-auth middleware.
+      - traefik.http.routers.authentik-outpost.rule=Host(`${DOMAIN}`) && PathPrefix(`/outpost.goauthentik.io/`)
+      - traefik.http.routers.authentik-outpost.priority=100
+      - traefik.http.routers.authentik-outpost.entrypoints=websecure
+      - traefik.http.routers.authentik-outpost.tls=true
+      - traefik.http.routers.authentik-outpost.tls.certresolver=cloudflare
+      - traefik.http.routers.authentik-outpost.service=authentik
+
+      # Forward-auth middleware (referenced elsewhere as authentik@docker).
+      - traefik.http.middlewares.authentik.forwardauth.address=http://authentik-server:9000/outpost.goauthentik.io/auth/traefik
+      - traefik.http.middlewares.authentik.forwardauth.trustForwardHeader=true
+      - traefik.http.middlewares.authentik.forwardauth.authResponseHeaders=X-authentik-username,X-authentik-groups,X-authentik-entitlements,X-authentik-email,X-authentik-name,X-authentik-uid,X-authentik-jwt,X-authentik-meta-jwks,X-authentik-meta-outpost,X-authentik-meta-provider,X-authentik-meta-app,X-authentik-meta-version
+
+  authentik-worker:
+    image: ghcr.io/goauthentik/server:${AUTHENTIK_TAG}
+    container_name: authentik-worker
+    restart: unless-stopped
+    command: worker
+    environment:
+      AUTHENTIK_SECRET_KEY: ${AUTHENTIK_SECRET_KEY}
+      AUTHENTIK_POSTGRESQL__HOST: postgres
+      AUTHENTIK_POSTGRESQL__PORT: 5432
+      AUTHENTIK_POSTGRESQL__NAME: authentik
+      AUTHENTIK_POSTGRESQL__USER: authentik
+      AUTHENTIK_POSTGRESQL__PASSWORD: ${PG_PASS}
+      AUTHENTIK_ERROR_REPORTING__ENABLED: "false"
+      AUTHENTIK_DISABLE_STARTUP_ANALYTICS: "true"
+      AUTHENTIK_DISABLE_UPDATE_CHECK: "false"
+      # Creates the akadmin account on first start, so nobody on the Internet
+      # can claim it through the public initial-setup page.
+      AUTHENTIK_BOOTSTRAP_PASSWORD: ${AUTHENTIK_BOOTSTRAP_PASSWORD}
+      AUTHENTIK_BOOTSTRAP_EMAIL: ${AUTHENTIK_BOOTSTRAP_EMAIL}
+    volumes:
+      - authentik_media:/media
+      - authentik_templates:/templates
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - authentik-internal
+      # Outbound access for SMTP (password recovery, notifications).
+      - proxy
+
+networks:
+  socket-proxy:
+    name: traefik-socket-proxy
+    internal: true
+  proxy:
+    name: traefik-proxy
+    ipam:
+      config:
+        - subnet: ${PROXY_SUBNET}
+  authentik-internal:
+    name: authentik-internal
+    internal: true
+
+volumes:
+  authentik_postgres:
+  authentik_media:
+  authentik_templates:

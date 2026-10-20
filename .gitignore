@@ -1,0 +1,9 @@
+# Secrets
+.env
+
+# ACME private keys/certificates
+letsencrypt/*
+!letsencrypt/.gitkeep
+
+# Traefik access logs
+logs/
